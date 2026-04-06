@@ -29,15 +29,14 @@ def get_ldap_groups() -> List[str]:
             for dn, entry in rdata:
                 if not entry or "cn" not in entry:
                     continue
-                cn_raw = entry.get("cn")
-                if not cn_raw:
+                cn_list = entry.get("cn")
+                if not cn_list or len(cn_list) == 0 or cn_list[0] is None:
                     continue
-                cn_val = cn_raw[0]
-                if cn_val is None:
-                    continue
+                cn_val = cn_list[0]
                 cn = cn_val.decode("utf-8") if isinstance(cn_val, bytes) else cn_val
                 groups.append(cn)
 
+            # Обновляем cookie для постраничного поиска
             cookie = None
             for ctrl in serverctrls:
                 if ctrl.controlType == ldap.controls.SimplePagedResultsControl.controlType:
