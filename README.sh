@@ -34,8 +34,7 @@ ROLE_EDITOR = os.getenv("ROLE_EDITOR")
 
 USER_DIRECTORY = os.getenv("USER_DIRECTORY")
 
-REGEX = r"cr-gd-zabbix_csc_(csc-sys-[0-9]+)-(viewers|editors)"
-
+REGEX = r"
 # --- Класс для работы с Zabbix API (с токеном) ---
 class Zabbix:
     def __init__(self):
