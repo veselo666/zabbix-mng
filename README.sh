@@ -1,4 +1,5 @@
-def get_ldap_groups() -> List[dict]:
+# ------------------ LDAP ------------------
+def get_ldap_groups() -> List[str]:
     ldap.set_option(ldap.OPT_REFERRALS, 0)
     ldap.set_option(ldap.OPT_X_TLS_REQUIRE_CERT, ldap.OPT_X_TLS_NEVER if LDAP_IGNORE_CERT else ldap.OPT_X_TLS_DEMAND)
 
@@ -10,7 +11,6 @@ def get_ldap_groups() -> List[dict]:
     except ldap.LDAPError as e:
         raise Exception(f"Ошибка LDAP: {e}")
 
-    # --- Параметры постраничного поиска ---
     page_size = 500
     cookie = None
     groups = []
@@ -25,20 +25,26 @@ def get_ldap_groups() -> List[dict]:
                 serverctrls=[ldap.controls.SimplePagedResultsControl(True, size=page_size, cookie=cookie)]
             )
             rtype, rdata, rmsgid, serverctrls = conn.result3(msgid)
+
             for dn, entry in rdata:
                 if not entry or "cn" not in entry:
                     continue
-                cn_raw = entry["cn"][0]
-                cn = cn_raw.decode("utf-8") if isinstance(cn_raw, bytes) else cn_raw
+                cn_raw = entry.get("cn")
+                if not cn_raw:
+                    continue
+                cn_val = cn_raw[0]
+                if cn_val is None:
+                    continue
+                cn = cn_val.decode("utf-8") if isinstance(cn_val, bytes) else cn_val
                 groups.append(cn)
 
-            # Обновляем cookie
             cookie = None
             for ctrl in serverctrls:
                 if ctrl.controlType == ldap.controls.SimplePagedResultsControl.controlType:
                     cookie = ctrl.cookie
             if not cookie:
                 break
+
     except ldap.LDAPError as e:
         raise Exception(f"Ошибка поиска LDAP: {e}")
     finally:
