@@ -25,8 +25,7 @@ LDAP_USER = os.getenv("LDAP_USER")
 LDAP_PASS = os.getenv("LDAP_PASS")
 
 ZABBIX_URL = os.getenv("ZABBIX_URL")
-ZABBIX_USER = os.getenv("ZABBIX_USER")
-ZABBIX_PASS = os.getenv("ZABBIX_PASS")
+ZABBIX_TOKEN = os.getenv("ZABBIX_TOKEN")          # API-токен вместо логина/пароля
 
 PREFIX = os.getenv("LDAP_GROUP_PREFIX")
 
@@ -35,16 +34,26 @@ ROLE_EDITOR = os.getenv("ROLE_EDITOR")
 
 USER_DIRECTORY = os.getenv("USER_DIRECTORY")
 
-REGEX = r"<REGEX>"
-# --- Класс для работы с Zabbix API ---
+REGEX = r"cr-gd-zabbix_csc_(csc-sys-[0-9]+)-(viewers|editors)"
+
+# --- Класс для работы с Zabbix API (с токеном) ---
 class Zabbix:
     def __init__(self):
-        self.auth = None
+        self.auth = ZABBIX_TOKEN
         self.id = 0
-        self.login()
+        # Проверяем работоспособность токена
+        self._verify_token()
+
+    def _verify_token(self):
+        """Проверяет, что токен действителен, вызывая apiinfo.version"""
+        try:
+            self.call("apiinfo.version", {})
+            logging.info("API-токен успешно прошёл проверку")
+        except Exception as e:
+            raise Exception(f"Недействительный API-токен: {e}")
 
     def call(self, method, params):
-        """Универсальный вызов метода Zabbix API"""
+        """Универсальный вызов метода Zabbix API с токеном"""
         self.id += 1
         payload = {
             "jsonrpc": "2.0",
@@ -64,19 +73,6 @@ class Zabbix:
         if "result" not in data:
             raise Exception(f"Zabbix API не вернул 'result' в методе {method}. Ответ: {data}")
         return data["result"]
-
-    def login(self):
-    """Авторизация в Zabbix с использованием API-токена"""
-    if not ZABBIX_TOKEN:
-        raise Exception("API-токен не найден в config.env. Добавьте переменную ZABBIX_TOKEN.")
-    
-    # Токен используется сразу при создании сессии, метод user.login не нужен
-    self.auth = ZABBIX_TOKEN 
-    # Небольшая проверка: пытаемся получить версию API, чтобы убедиться, что токен работает
-    try:
-        self.call("apiinfo.version", {})
-    except Exception as e:
-        raise Exception(f"Не удалось авторизоваться с использованием API-токена: {e}")
 
 # --- Получение групп из LDAP ---
 def ldap_groups():
@@ -118,7 +114,7 @@ def ldap_groups():
 def main():
     logging.info("=== Начало синхронизации ===")
 
-    # 1. Подключение к Zabbix
+    # 1. Подключение к Zabbix через токен
     zbx = Zabbix()
 
     # 2. Получение ролей из Zabbix
