@@ -6,7 +6,6 @@ import requests
 import os
 import sys
 import logging
-from typing import List, Dict
 from datetime import datetime
 from dotenv import load_dotenv
 from requests.adapters import HTTPAdapter
@@ -16,12 +15,11 @@ from urllib3.util.retry import Retry
 
 load_dotenv("config.env")
 
-REQUIRED_VARS = [
+REQUIRED = [
     "LDAP_URI",
     "LDAP_BASE",
     "LDAP_USER",
     "LDAP_PASS",
-    "LDAP_GROUP_PREFIX",
     "ZABBIX_URL",
     "ZABBIX_TOKEN",
     "USER_DIRECTORY",
@@ -30,16 +28,15 @@ REQUIRED_VARS = [
     "ROLE_DEFAULT"
 ]
 
-missing = [v for v in REQUIRED_VARS if not os.getenv(v)]
+missing = [v for v in REQUIRED if not os.getenv(v)]
 if missing:
-    print(f"Missing env vars: {missing}")
+    print("Missing env:", missing)
     sys.exit(1)
 
 LDAP_URI = os.getenv("LDAP_URI")
 LDAP_BASE = os.getenv("LDAP_BASE")
 LDAP_USER = os.getenv("LDAP_USER")
 LDAP_PASS = os.getenv("LDAP_PASS")
-PREFIX = os.getenv("LDAP_GROUP_PREFIX")
 
 ZABBIX_URL = os.getenv("ZABBIX_URL")
 ZABBIX_TOKEN = os.getenv("ZABBIX_TOKEN")
@@ -51,6 +48,7 @@ ROLE_EDITOR = os.getenv("ROLE_EDITOR")
 ROLE_DEFAULT = os.getenv("ROLE_DEFAULT")
 
 VERIFY_SSL = os.getenv("VERIFY_SSL", "true").lower() == "true"
+LDAP_IGNORE_CERT = os.getenv("LDAP_IGNORE_CERT", "true").lower() == "true"
 DRY_RUN = os.getenv("DRY_RUN", "false").lower() == "true"
 
 # ------------------ LOGGING ------------------
@@ -79,8 +77,8 @@ def create_session():
 
     adapter = HTTPAdapter(max_retries=retry)
 
-    session.mount("http://", adapter)
     session.mount("https://", adapter)
+    session.mount("http://", adapter)
 
     return session
 
@@ -88,13 +86,12 @@ def create_session():
 
 class ZabbixAPI:
 
-    def __init__(self, url: str, token: str):
-        self.url = url
-        self.token = token
-        self.id = 0
-        self.session = create_session()
+    def __init__(self):
 
-    def call(self, method: str, params: dict):
+        self.session = create_session()
+        self.id = 0
+
+    def call(self, method, params):
 
         self.id += 1
 
@@ -107,20 +104,20 @@ class ZabbixAPI:
 
         headers = {
             "Content-Type": "application/json-rpc",
-            "Authorization": f"Bearer {self.token}"
+            "Authorization": f"Bearer {ZABBIX_TOKEN}"
         }
 
-        response = self.session.post(
-            self.url,
+        r = self.session.post(
+            ZABBIX_URL,
             json=payload,
             headers=headers,
             verify=VERIFY_SSL,
             timeout=30
         )
 
-        response.raise_for_status()
+        r.raise_for_status()
 
-        data = response.json()
+        data = r.json()
 
         if "error" in data:
             raise Exception(data["error"])
@@ -132,15 +129,15 @@ class ZabbixAPI:
         roles = self.call("role.get", {"output": ["roleid", "name"]})
         return {r["name"]: r["roleid"] for r in roles}
 
-    def get_user_groups(self):
+    def get_groups(self):
 
         groups = self.call("usergroup.get", {"output": ["usrgrpid", "name"]})
         return {g["name"]: g["usrgrpid"] for g in groups}
 
-    def create_user_group(self, name):
+    def create_group(self, name):
 
         if DRY_RUN:
-            logging.info(f"DRY RUN: create group {name}")
+            logging.info(f"DRY RUN create group {name}")
             return "0"
 
         res = self.call("usergroup.create", {"name": name})
@@ -150,10 +147,10 @@ class ZabbixAPI:
 
         return self.call("userdirectory.get", {"output": "extend"})
 
-    def update_provisioning(self, directory_id, mappings):
+    def update_provision(self, directory_id, mappings):
 
         if DRY_RUN:
-            logging.info("DRY RUN: provisioning update skipped")
+            logging.info("DRY RUN provisioning update")
             return
 
         self.call(
@@ -171,24 +168,19 @@ def get_ldap_groups():
     ldap.set_option(ldap.OPT_REFERRALS, 0)
     ldap.set_option(ldap.OPT_NETWORK_TIMEOUT, 10)
 
-    if os.getenv("LDAP_IGNORE_CERT", "true").lower() == "true":
+    if LDAP_IGNORE_CERT:
         ldap.set_option(ldap.OPT_X_TLS_REQUIRE_CERT, ldap.OPT_X_TLS_NEVER)
 
     conn = ldap.initialize(LDAP_URI)
-
     conn.set_option(ldap.OPT_PROTOCOL_VERSION, 3)
 
-    if LDAP_URI.startswith("ldaps://"):
-        conn.set_option(ldap.OPT_X_TLS, ldap.OPT_X_TLS_DEMAND)
-        conn.set_option(ldap.OPT_X_TLS_NEWCTX, 0)
+    logging.info("LDAP connect...")
 
-    try:
-        conn.simple_bind_s(LDAP_USER, LDAP_PASS)
-        logging.info("LDAP bind successful")
-    except ldap.LDAPError as e:
-        raise Exception(f"LDAP bind error: {e}")
+    conn.simple_bind_s(LDAP_USER, LDAP_PASS)
 
-    search_filter = f"(cn={PREFIX}*)"
+    logging.info("LDAP bind OK")
+
+    search_filter = "(cn=cr-gd-zabbix*)"
 
     result = conn.search_s(
         LDAP_BASE,
@@ -206,42 +198,64 @@ def get_ldap_groups():
         if "cn" not in entry:
             continue
 
-        cn = entry["cn"][0].decode()
+        cn = entry["cn"][0].decode().strip()
 
-        if cn.startswith(PREFIX):
-            groups.append(cn)
+        name = cn.lower()
+
+        if "zabbix" not in name:
+            continue
+
+        groups.append(cn)
 
     logging.info(f"LDAP groups found: {len(groups)}")
+
+    for g in groups:
+        logging.info(f"LDAP: {g}")
 
     return groups
 
 # ------------------ ROLE DETECTION ------------------
 
-def detect_role(group_name: str):
+def detect_role(name):
 
-    name = group_name.lower()
+    n = name.lower()
 
-    if name.endswith("viewers"):
+    if "viewers" in n:
         return ROLE_VIEWER
 
-    if name.endswith("editors"):
+    if "editors" in n:
         return ROLE_EDITOR
 
     return ROLE_DEFAULT
+
+# ------------------ NORMALIZE NAME ------------------
+
+def normalize_group(name):
+
+    n = name.lower()
+
+    n = n.replace("cr-gd-", "")
+    n = n.replace("zabbix_", "")
+    n = n.replace("zabbix", "")
+    n = n.replace("__", "_")
+    n = n.strip("_")
+
+    return n
 
 # ------------------ MAIN ------------------
 
 def main():
 
-    logging.info("START LDAP → ZABBIX SYNC")
+    logging.info("===== START LDAP → ZABBIX SYNC =====")
 
-    zbx = ZabbixAPI(ZABBIX_URL, ZABBIX_TOKEN)
+    zbx = ZabbixAPI()
 
     roles = zbx.get_roles()
 
     for r in [ROLE_VIEWER, ROLE_EDITOR, ROLE_DEFAULT]:
+
         if r not in roles:
-            raise Exception(f"Role {r} not found in Zabbix")
+            raise Exception(f"Role not found: {r}")
 
     directories = zbx.get_directories()
 
@@ -251,13 +265,13 @@ def main():
     )
 
     if not directory:
-        raise Exception("LDAP directory not found")
+        raise Exception("User directory not found")
 
     directory_id = directory["userdirectoryid"]
 
     logging.info(f"Directory ID: {directory_id}")
 
-    zabbix_groups = zbx.get_user_groups()
+    zabbix_groups = zbx.get_groups()
 
     ldap_groups = get_ldap_groups()
 
@@ -265,18 +279,18 @@ def main():
 
     for ldap_group in ldap_groups:
 
-        zabbix_group = ldap_group.replace(PREFIX, "").lower()
+        zabbix_group = normalize_group(ldap_group)
 
         role_name = detect_role(ldap_group)
         role_id = roles[role_name]
 
         if zabbix_group not in zabbix_groups:
 
-            usrgrpid = zbx.create_user_group(zabbix_group)
+            usrgrpid = zbx.create_group(zabbix_group)
 
             zabbix_groups[zabbix_group] = usrgrpid
 
-            logging.info(f"Created group: {zabbix_group}")
+            logging.info(f"Created Zabbix group: {zabbix_group}")
 
         usrgrpid = zabbix_groups[zabbix_group]
 
@@ -288,6 +302,10 @@ def main():
             ]
         })
 
+        logging.info(
+            f"MAP: {ldap_group} → {zabbix_group} → {role_name}"
+        )
+
     existing = directory.get("provision_groups", [])
 
     merged = {m["name"]: m for m in existing}
@@ -297,11 +315,11 @@ def main():
 
     final = list(merged.values())
 
-    zbx.update_provisioning(directory_id, final)
+    zbx.update_provision(directory_id, final)
 
-    logging.info(f"Provisioning updated: {len(final)} groups")
+    logging.info(f"Provision updated: {len(final)} groups")
 
-    logging.info("SYNC COMPLETED")
+    logging.info("===== SYNC COMPLETED =====")
 
 # ------------------ ENTRY ------------------
 
