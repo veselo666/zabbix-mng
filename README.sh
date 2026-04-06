@@ -66,29 +66,17 @@ class Zabbix:
         return data["result"]
 
     def login(self):
-        """Авторизация в Zabbix и получение токена"""
-        payload = {
-            "jsonrpc": "2.0",
-            "method": "user.login",
-            "params": {
-                "username": ZABBIX_USER,
-                "password": ZABBIX_PASS
-            },
-            "id": 1
-        }
-        try:
-            r = requests.post(ZABBIX_URL, json=payload, verify=False)
-            data = r.json()
-        except Exception as e:
-            raise Exception(f"Не удалось подключиться к Zabbix по адресу {ZABBIX_URL}: {e}")
-
-        if "error" in data:
-            raise Exception(f"Ошибка авторизации Zabbix: {data['error']}")
-        if "result" not in data:
-            raise Exception(f"Zabbix API вернул ответ без 'result': {data}")
-
-        self.auth = data["result"]
-        logging.info("Успешная авторизация в Zabbix API")
+    """Авторизация в Zabbix с использованием API-токена"""
+    if not ZABBIX_TOKEN:
+        raise Exception("API-токен не найден в config.env. Добавьте переменную ZABBIX_TOKEN.")
+    
+    # Токен используется сразу при создании сессии, метод user.login не нужен
+    self.auth = ZABBIX_TOKEN 
+    # Небольшая проверка: пытаемся получить версию API, чтобы убедиться, что токен работает
+    try:
+        self.call("apiinfo.version", {})
+    except Exception as e:
+        raise Exception(f"Не удалось авторизоваться с использованием API-токена: {e}")
 
 # --- Получение групп из LDAP ---
 def ldap_groups():
