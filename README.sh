@@ -61,20 +61,27 @@ class Zabbix:
         return data["result"]
 
     def login(self):
+    payload = {
+        "jsonrpc": "2.0",
+        "method": "user.login",
+        "params": {
+            "username": ZABBIX_USER,
+            "password": ZABBIX_PASS
+        },
+        "id": 1
+    }
+    r = requests.post(ZABBIX_URL, json=payload, verify=False)
+    data = r.json()
 
-        payload = {
-            "jsonrpc": "2.0",
-            "method": "user.login",
-            "params": {
-                "username": ZABBIX_USER,
-                "password": ZABBIX_PASS
-            },
-            "id": 1
-        }
+    # Проверяем, есть ли ошибка в ответе
+    if "error" in data:
+        error_msg = data["error"].get("data", "Неизвестная ошибка")
+        raise Exception(f"Ошибка авторизации Zabbix API: {error_msg}")
 
-        r = requests.post(ZABBIX_URL, json=payload, verify=False)
-
-        self.auth = r.json()["result"]
+    # Если ошибки нет, извлекаем токен
+    self.auth = data.get("result")
+    if not self.auth:
+        raise Exception("Токен авторизации не получен, проверьте URL и данные для входа.")
 
 
 def ldap_groups():
