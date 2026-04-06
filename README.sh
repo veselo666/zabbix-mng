@@ -27,14 +27,24 @@ def get_ldap_groups() -> List[str]:
             rtype, rdata, rmsgid, serverctrls = conn.result3(msgid)
 
             for dn, entry in rdata:
-                if not entry or "cn" not in entry:
+                # Проверяем, что entry существует и содержит cn
+                if not isinstance(entry, dict):
                     continue
                 cn_list = entry.get("cn")
-                if not cn_list or len(cn_list) == 0 or cn_list[0] is None:
+                if not isinstance(cn_list, list) or len(cn_list) == 0:
                     continue
                 cn_val = cn_list[0]
-                cn = cn_val.decode("utf-8") if isinstance(cn_val, bytes) else cn_val
-                groups.append(cn)
+                if cn_val is None:
+                    continue
+                try:
+                    cn = cn_val.decode("utf-8") if isinstance(cn_val, bytes) else str(cn_val)
+                except Exception as e:
+                    logging.warning(f"Пропущена группа из-за ошибки декодирования: {cn_val} ({e})")
+                    continue
+                # Пропускаем пустые строки после декодирования
+                if not cn.strip():
+                    continue
+                groups.append(cn.strip())
 
             # Обновляем cookie для постраничного поиска
             cookie = None
