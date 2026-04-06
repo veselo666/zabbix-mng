@@ -1,25 +1,19 @@
-import os
-import re
-import sys
-import logging
+import ldap
 import requests
-
-from ldap3 import Server, Connection, ALL, SUBTREE
+import re
+import os
+import logging
 from dotenv import load_dotenv
 
 load_dotenv("config.env")
 
 logging.basicConfig(
+    filename="sync.log",
     level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
-    handlers=[
-        logging.FileHandler("sync.log"),
-        logging.StreamHandler(sys.stdout)
-    ]
+    format="%(asctime)s %(levelname)s %(message)s"
 )
 
 LDAP_URI = os.getenv("LDAP_URI")
-LDAP_PORT = int(os.getenv("LDAP_PORT"))
 LDAP_BASE = os.getenv("LDAP_BASE")
 LDAP_USER = os.getenv("LDAP_USER")
 LDAP_PASS = os.getenv("LDAP_PASS")
@@ -28,19 +22,19 @@ ZABBIX_URL = os.getenv("ZABBIX_URL")
 ZABBIX_USER = os.getenv("ZABBIX_USER")
 ZABBIX_PASS = os.getenv("ZABBIX_PASS")
 
-DEFAULT_USER_GROUP = os.getenv("DEFAULT_USER_GROUP")
+PREFIX = os.getenv("LDAP_GROUP_PREFIX")
+
 ROLE_VIEWER = os.getenv("ROLE_VIEWER")
 ROLE_EDITOR = os.getenv("ROLE_EDITOR")
 
-REGEX = r"<REGEX>"
+USER_DIRECTORY = os.getenv("USER_DIRECTORY")
 
-requests.packages.urllib3.disable_warnings()
+REGEX = r"<RRR>"
 
 
-class ZabbixAPI:
+class Zabbix:
 
     def __init__(self):
-        self.url = ZABBIX_URL
         self.auth = None
         self.id = 0
         self.login()
@@ -57,12 +51,7 @@ class ZabbixAPI:
             "id": self.id
         }
 
-        r = requests.post(
-            self.url,
-            json=payload,
-            verify=False,
-            timeout=10
-        )
+        r = requests.post(ZABBIX_URL, json=payload, verify=False)
 
         data = r.json()
 
@@ -83,170 +72,118 @@ class ZabbixAPI:
             "id": 1
         }
 
-        r = requests.post(
-            self.url,
-            json=payload,
-            verify=False
-        )
+        r = requests.post(ZABBIX_URL, json=payload, verify=False)
 
         self.auth = r.json()["result"]
 
 
-def get_ldap_groups():
+def ldap_groups():
 
-    logging.info("Connecting to LDAP")
+    ldap.set_option(ldap.OPT_REFERRALS, 0)
+    ldap.set_option(ldap.OPT_X_TLS_REQUIRE_CERT, ldap.OPT_X_TLS_NEVER)
 
-    server = Server(LDAP_URI, port=LDAP_PORT, get_info=ALL)
+    conn = ldap.initialize(LDAP_URI)
+    conn.simple_bind_s(LDAP_USER, LDAP_PASS)
 
-    conn = Connection(
-        server,
-        LDAP_USER,
-        LDAP_PASS,
-        auto_bind=True
-    )
-
-    conn.search(
+    result = conn.search_s(
         LDAP_BASE,
-        "(<REGEX>)",
-        SUBTREE,
-        attributes=["cn", "member"]
+        ldap.SCOPE_SUBTREE,
+        f"(cn={PREFIX}*)",
+        ["cn"]
     )
 
     groups = []
 
-    for entry in conn.entries:
+    for dn, entry in result:
 
-        cn = str(entry.cn)
-
-        match = re.match(REGEX, cn)
-
-        if not match:
+        if not entry:
             continue
 
-        members = []
+        cn = entry["cn"][0].decode()
 
-        if "member" in entry:
-            members = entry.member.values
+        m = re.match(REGEX, cn)
 
-        groups.append({
-            "cn": cn,
-            "system": match.group(1),
-            "type": match.group(2),
-            "members": members
-        })
-
-    logging.info(f"Found {len(groups)} LDAP groups")
+        if m:
+            groups.append({
+                "ldap": cn,
+                "system": m.group(1),
+                "type": m.group(2)
+            })
 
     return groups
 
 
-def extract_login(dn):
-
-    parts = dn.split(",")
-
-    for p in parts:
-
-        if p.startswith("CN="):
-            return p.replace("CN=", "").lower()
-
-    return None
-
-
 def main():
 
-    zbx = ZabbixAPI()
-
-    logging.info("Loading roles")
+    zbx = Zabbix()
 
     roles = zbx.call("role.get", {"output": ["roleid", "name"]})
     role_map = {r["name"]: r["roleid"] for r in roles}
 
-    default_group = zbx.call(
-        "usergroup.get",
-        {"filter": {"name": DEFAULT_USER_GROUP}}
-    )[0]["usrgrpid"]
+    directories = zbx.call("userdirectory.get", {"output": "extend"})
 
-    groups = get_ldap_groups()
+    directory_id = None
+
+    for d in directories:
+        if d["name"] == USER_DIRECTORY:
+            directory_id = d["userdirectoryid"]
+
+    if not directory_id:
+        raise Exception("LDAP directory not found")
+
+    groups = ldap_groups()
 
     for g in groups:
 
         system = g["system"]
-        group_type = g["type"]
+        gtype = g["type"]
 
-        user_group_name = f"{system}-{group_type}".lower()
+        user_group = f"{system}-{gtype}".lower()
 
-        role_name = ROLE_VIEWER if group_type == "viewers" else ROLE_EDITOR
+        role_name = ROLE_VIEWER if gtype == "viewers" else ROLE_EDITOR
         roleid = role_map[role_name]
 
-        logging.info(f"Processing {user_group_name}")
+        logging.info(f"Processing {user_group}")
 
-        zg = zbx.call(
+        ug = zbx.call(
             "usergroup.get",
-            {"filter": {"name": user_group_name}}
+            {"filter": {"name": user_group}}
         )
 
-        if not zg:
+        if not ug:
 
-            logging.info(f"Creating user group {user_group_name}")
-
-            zg = zbx.call(
+            res = zbx.call(
                 "usergroup.create",
-                {"name": user_group_name}
+                {"name": user_group}
             )
 
-            usrgrpid = zg["usrgrpids"][0]
+            usrgrpid = res["usrgrpids"][0]
 
         else:
-            usrgrpid = zg[0]["usrgrpid"]
+            usrgrpid = ug[0]["usrgrpid"]
 
-        for member in g["members"]:
+        mappings = zbx.call(
+            "userdirectorygroup.get",
+            {
+                "filter": {"name": g["ldap"]},
+                "userdirectoryids": directory_id
+            }
+        )
 
-            login = extract_login(member)
+        if mappings:
+            continue
 
-            if not login:
-                continue
+        logging.info(f"Create mapping {g['ldap']}")
 
-            logging.info(f"Sync user {login}")
-
-            u = zbx.call(
-                "user.get",
-                {
-                    "filter": {"username": login},
-                    "output": ["userid"]
-                }
-            )
-
-            if not u:
-
-                logging.info(f"Create user {login}")
-
-                zbx.call(
-                    "user.create",
-                    {
-                        "username": login,
-                        "roleid": roleid,
-                        "usrgrps": [
-                            {"usrgrpid": usrgrpid},
-                            {"usrgrpid": default_group}
-                        ]
-                    }
-                )
-
-            else:
-
-                logging.info(f"Update user {login}")
-
-                zbx.call(
-                    "user.update",
-                    {
-                        "userid": u[0]["userid"],
-                        "roleid": roleid,
-                        "usrgrps": [
-                            {"usrgrpid": usrgrpid},
-                            {"usrgrpid": default_group}
-                        ]
-                    }
-                )
+        zbx.call(
+            "userdirectorygroup.create",
+            {
+                "userdirectoryid": directory_id,
+                "name": g["ldap"],
+                "roleid": roleid,
+                "usrgrps": [{"usrgrpid": usrgrpid}]
+            }
+        )
 
 
 if __name__ == "__main__":
