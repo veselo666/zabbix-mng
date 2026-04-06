@@ -171,9 +171,22 @@ def get_ldap_groups():
     ldap.set_option(ldap.OPT_REFERRALS, 0)
     ldap.set_option(ldap.OPT_NETWORK_TIMEOUT, 10)
 
+    if os.getenv("LDAP_IGNORE_CERT", "true").lower() == "true":
+        ldap.set_option(ldap.OPT_X_TLS_REQUIRE_CERT, ldap.OPT_X_TLS_NEVER)
+
     conn = ldap.initialize(LDAP_URI)
 
-    conn.simple_bind_s(LDAP_USER, LDAP_PASS)
+    conn.set_option(ldap.OPT_PROTOCOL_VERSION, 3)
+
+    if LDAP_URI.startswith("ldaps://"):
+        conn.set_option(ldap.OPT_X_TLS, ldap.OPT_X_TLS_DEMAND)
+        conn.set_option(ldap.OPT_X_TLS_NEWCTX, 0)
+
+    try:
+        conn.simple_bind_s(LDAP_USER, LDAP_PASS)
+        logging.info("LDAP bind successful")
+    except ldap.LDAPError as e:
+        raise Exception(f"LDAP bind error: {e}")
 
     search_filter = f"(cn={PREFIX}*)"
 
@@ -196,7 +209,6 @@ def get_ldap_groups():
         cn = entry["cn"][0].decode()
 
         if cn.startswith(PREFIX):
-
             groups.append(cn)
 
     logging.info(f"LDAP groups found: {len(groups)}")
