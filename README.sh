@@ -50,7 +50,7 @@ ROLE_VIEWER = os.getenv("ROLE_VIEWER")
 ROLE_EDITOR = os.getenv("ROLE_EDITOR")
 USER_DIRECTORY = os.getenv("USER_DIRECTORY")
 
-REGEX = r"<<>>"
+REGEX = r"cr-gd-zabbix_csc_(csc-sys-[0-9]+)-(viewers|editors)"
 
 # ------------------ ZABBIX API ------------------
 class ZabbixAPI:
@@ -58,7 +58,6 @@ class ZabbixAPI:
         self.url = url
         self.token = token
         self.id = 0
-        self._verify_connection()
 
     def _call(self, method: str, params: dict, auth_required: bool = True) -> dict:
         self.id += 1
@@ -86,30 +85,21 @@ class ZabbixAPI:
             raise Exception(f"Нет 'result' в ответе {method}: {data}")
         return data["result"]
 
-    def _verify_connection(self):
-        try:
-            self._call("apiinfo.version", [], auth_required=False)
-            logging.info("Соединение с Zabbix API установлено")
-        except Exception as e:
-            raise Exception(f"Не удалось подключиться к Zabbix: {e}")
-
     def get_roles(self) -> Dict[str, str]:
         roles = self._call("role.get", {"output": ["roleid", "name"]})
         return {r["name"]: r["roleid"] for r in roles}
 
-    def get_user_group(self, name: str) -> Optional[dict]:
-        # В Zabbix 7.4 usergroup.get принимает параметр name напрямую
-        groups = self._call("usergroup.get", {"name": name})
-        return groups[0] if groups else None
+    def get_all_user_groups(self) -> List[dict]:
+        """Возвращает список всех групп пользователей."""
+        return self._call("usergroup.get", {"output": "extend"})
 
     def create_user_group(self, name: str) -> str:
         res = self._call("usergroup.create", {"name": name})
         return res["usrgrpids"][0]
 
-    def get_user_directory(self, name: str) -> Optional[dict]:
-        # userdirectory.get принимает параметр name напрямую
-        directories = self._call("userdirectory.get", {"name": name, "output": "extend"})
-        return directories[0] if directories else None
+    def get_all_user_directories(self) -> List[dict]:
+        """Возвращает список всех LDAP-каталогов."""
+        return self._call("userdirectory.get", {"output": "extend"})
 
     def update_user_directory_mappings(self, directory_id: str, mappings: List[dict]) -> dict:
         return self._call("userdirectory.update", {
@@ -161,41 +151,47 @@ def main():
 
     zbx = ZabbixAPI(ZABBIX_URL, ZABBIX_TOKEN)
 
-    # Роли
+    # 1. Получаем роли
     role_map = zbx.get_roles()
     if ROLE_VIEWER not in role_map:
-        raise Exception(f"Роль '{ROLE_VIEWER}' не найдена")
+        raise Exception(f"Роль '{ROLE_VIEWER}' не найдена. Доступные: {list(role_map.keys())}")
     if ROLE_EDITOR not in role_map:
-        raise Exception(f"Роль '{ROLE_EDITOR}' не найдена")
+        raise Exception(f"Роль '{ROLE_EDITOR}' не найдена. Доступные: {list(role_map.keys())}")
 
-    # LDAP каталог
-    directory = zbx.get_user_directory(USER_DIRECTORY)
+    # 2. Получаем все LDAP-каталоги и ищем нужный по имени
+    directories = zbx.get_all_user_directories()
+    directory = next((d for d in directories if d["name"] == USER_DIRECTORY), None)
     if not directory:
-        raise Exception(f"Каталог '{USER_DIRECTORY}' не найден в Zabbix")
+        raise Exception(f"Каталог '{USER_DIRECTORY}' не найден. Создайте его в Zabbix вручную.")
     dir_id = directory["userdirectoryid"]
-    logging.info(f"Каталог '{USER_DIRECTORY}' ID={dir_id}")
+    logging.info(f"Найден каталог '{USER_DIRECTORY}' ID={dir_id}")
 
-    # Группы из LDAP
+    # 3. Получаем все группы пользователей Zabbix
+    all_groups = zbx.get_all_user_groups()
+    group_by_name = {g["name"]: g for g in all_groups}
+
+    # 4. Получаем LDAP-группы
     ldap_groups = get_ldap_groups()
     if not ldap_groups:
-        logging.warning("Нет групп LDAP для синхронизации")
+        logging.warning("Нет LDAP-групп для синхронизации")
         return
 
-    # Создаём группы Zabbix и готовим маппинги
+    # 5. Создаём недостающие группы Zabbix и готовим маппинги
     new_mappings = []
-    created = 0
+    created_count = 0
     for lg in ldap_groups:
-        group_name = f"{lg['system']}-{lg['type']}".lower()
+        zabbix_group_name = f"{lg['system']}-{lg['type']}".lower()
         role_name = ROLE_VIEWER if lg['type'] == 'viewers' else ROLE_EDITOR
         role_id = role_map[role_name]
 
-        ug = zbx.get_user_group(group_name)
-        if ug:
-            usrgrp_id = ug["usrgrpid"]
+        if zabbix_group_name in group_by_name:
+            usrgrp_id = group_by_name[zabbix_group_name]["usrgrpid"]
         else:
-            usrgrp_id = zbx.create_user_group(group_name)
-            created += 1
-            logging.info(f"Создана группа '{group_name}'")
+            usrgrp_id = zbx.create_user_group(zabbix_group_name)
+            created_count += 1
+            logging.info(f"Создана группа Zabbix: '{zabbix_group_name}'")
+            # Добавляем в кэш для последующих итераций
+            group_by_name[zabbix_group_name] = {"usrgrpid": usrgrp_id}
 
         new_mappings.append({
             "group_name": lg["ldap_name"],
@@ -203,28 +199,28 @@ def main():
             "roleid": role_id
         })
 
-    # Объединяем с существующими маппингами
-    existing = directory.get("provisioning_group_mappings", [])
-    merged = {m["group_name"]: m for m in existing}
+    # 6. Объединяем новые маппинги с существующими (чтобы не потерять ручные)
+    existing_mappings = directory.get("provisioning_group_mappings", [])
+    merged = {m["group_name"]: m for m in existing_mappings}
     for m in new_mappings:
         merged[m["group_name"]] = m
     final_mappings = list(merged.values())
 
     if final_mappings:
         zbx.update_user_directory_mappings(dir_id, final_mappings)
-        logging.info(f"Обновлено маппингов: {len(final_mappings)}")
+        logging.info(f"Обновлены маппинги для каталога '{USER_DIRECTORY}': {len(final_mappings)} записей")
     else:
         logging.warning("Нет маппингов для обновления")
 
     elapsed = datetime.now() - start
-    logging.info(f"=== Синхронизация завершена за {elapsed.total_seconds():.2f} с ===")
-    logging.info(f"Создано групп Zabbix: {created}, маппингов: {len(new_mappings)}")
+    logging.info(f"=== СИНХРОНИЗАЦИЯ ЗАВЕРШЕНА за {elapsed.total_seconds():.2f} с ===")
+    logging.info(f"Создано групп Zabbix: {created_count}, добавлено/обновлено маппингов: {len(new_mappings)}")
 
 if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        logging.info("Прервано")
+        logging.info("Прервано пользователем")
         sys.exit(0)
     except Exception as e:
         logging.error(f"КРИТИЧЕСКАЯ ОШИБКА: {e}")
