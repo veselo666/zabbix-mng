@@ -42,7 +42,7 @@ REQUIRED = [
     "ROLE_VIEWER",
     "ROLE_EDITOR",
 
-    # Super admin
+    # Super Admin
     "SUPER_ADMIN_ROLE",
     "SUPER_ADMIN_GROUP",
 
@@ -78,7 +78,6 @@ LDAP_BASE = os.getenv("LDAP_BASE")
 LDAP_USER = os.getenv("LDAP_USER")
 LDAP_PASS = os.getenv("LDAP_PASS")
 
-LDAP_CA_CERT = os.getenv("LDAP_CA_CERT", "")
 LDAP_TIMEOUT = int(os.getenv("LDAP_TIMEOUT", "10"))
 
 # Zabbix
@@ -271,11 +270,7 @@ def get_ldap_groups():
 
     ldap.set_option(ldap.OPT_REFERRALS, 0)
     ldap.set_option(ldap.OPT_NETWORK_TIMEOUT, LDAP_TIMEOUT)
-
-    if LDAP_CA_CERT:
-        ldap.set_option(ldap.OPT_X_TLS_CACERTFILE, LDAP_CA_CERT)
-
-    ldap.set_option(ldap.OPT_X_TLS_REQUIRE_CERT, ldap.OPT_X_TLS_DEMAND)
+    ldap.set_option(ldap.OPT_X_TLS_REQUIRE_CERT, ldap.OPT_X_TLS_NEVER)
 
     conn = ldap.initialize(LDAP_URI)
     conn.set_option(ldap.OPT_PROTOCOL_VERSION, 3)
@@ -303,13 +298,12 @@ def get_ldap_groups():
             continue
 
         cn = entry["cn"][0].decode().strip()
-
         groups.append(cn)
 
-    logging.info(f"LDAP groups found: {len(groups)}")
-
-    if len(groups) == 0:
+    if not groups:
         raise Exception("LDAP returned zero groups")
+
+    logging.info(f"LDAP groups found: {len(groups)}")
 
     return groups
 
@@ -357,7 +351,7 @@ def detect_role(name):
     return ROLE_DEFAULT
 
 # =========================================================
-# NORMALIZE
+# NORMALIZE GROUP
 # =========================================================
 
 def normalize_group(name):
@@ -452,7 +446,6 @@ def main():
         if zabbix_group not in zabbix_groups:
 
             usrgrpid = zbx.create_group(zabbix_group)
-
             zabbix_groups[zabbix_group] = usrgrpid
 
             logging.info(f"Created group: {zabbix_group}")
