@@ -185,14 +185,14 @@ def detect_role(name):
     n = name.lower()
     if n == SUPER_ADMIN_GROUP.lower():
         return SUPER_ADMIN_ROLE
-    if re.search(CSC_EDITOR_REGEX, n): return os.getenv("CSC_ROLE_EDITOR")
-    if re.search(CSC_VIEWER_REGEX, n): return os.getenv("CSC_ROLE_VIEWER")
-    if re.search(ATS_EDITOR_REGEX, n): return os.getenv("ATS_ROLE_EDITOR")
-    if re.search(ATS_VIEWER_REGEX, n): return os.getenv("ATS_ROLE_VIEWER")
-    if re.search(FCS_EDITOR_REGEX, n): return os.getenv("FCS_ROLE_EDITOR")
-    if re.search(FCS_VIEWER_REGEX, n): return os.getenv("FCS_ROLE_VIEWER")
-    if re.search(JET_EDITOR_REGEX, n): return os.getenv("JET_ROLE_EDITOR")
-    if re.search(JET_VIEWER_REGEX, n): return os.getenv("JET_ROLE_VIEWER")
+    if re.search(CSC_EDITOR_REGEX, n): return CSC_ROLE_EDITOR
+    if re.search(CSC_VIEWER_REGEX, n): return CSC_ROLE_VIEWER
+    if re.search(ATS_EDITOR_REGEX, n): return ATS_ROLE_EDITOR
+    if re.search(ATS_VIEWER_REGEX, n): return ATS_ROLE_VIEWER
+    if re.search(FCS_EDITOR_REGEX, n): return FCS_ROLE_EDITOR
+    if re.search(FCS_VIEWER_REGEX, n): return FCS_ROLE_VIEWER
+    if re.search(JET_EDITOR_REGEX, n): return JET_ROLE_EDITOR
+    if re.search(JET_VIEWER_REGEX, n): return JET_ROLE_VIEWER
     if "editors" in n: return ROLE_EDITOR
     if "viewers" in n: return ROLE_VIEWER
     return ROLE_DEFAULT
@@ -223,14 +223,14 @@ def main():
         ROLE_VIEWER,
         ROLE_EDITOR,
         SUPER_ADMIN_ROLE,
-        os.getenv("CSC_ROLE_VIEWER"),
-        os.getenv("CSC_ROLE_EDITOR"),
-        os.getenv("ATS_ROLE_VIEWER"),
-        os.getenv("ATS_ROLE_EDITOR"),
-        os.getenv("FCS_ROLE_VIEWER"),
-        os.getenv("FCS_ROLE_EDITOR"),
-        os.getenv("JET_ROLE_VIEWER"),
-        os.getenv("JET_ROLE_EDITOR")
+        CSC_ROLE_VIEWER,
+        CSC_ROLE_EDITOR,
+        ATS_ROLE_VIEWER,
+        ATS_ROLE_EDITOR,
+        FCS_ROLE_VIEWER,
+        FCS_ROLE_EDITOR,
+        JET_ROLE_VIEWER,
+        JET_ROLE_EDITOR
     ]
     for r in required_roles:
         if r and r not in roles:
@@ -258,6 +258,10 @@ def main():
     if not email_media_id:
         raise Exception(f"Email media type not found: {list(media_types.keys())}")
 
+    # existing provisioning
+    existing_groups = {m["name"]: m for m in directory.get("provision_groups", [])}
+    existing_media = {(m["mediatypeid"], m["attribute"]) for m in directory.get("provision_media", [])}
+
     provision_groups = []
     provision_media = []
 
@@ -272,17 +276,26 @@ def main():
 
         usrgrpid = zabbix_groups[zname]
 
-        provision_groups.append({
-            "name": lg,
-            "roleid": role_id,
-            "user_groups":[{"usrgrpid": usrgrpid}]
-        })
+        # idempotent groups
+        if lg not in existing_groups:
+            provision_groups.append({
+                "name": lg,
+                "roleid": role_id,
+                "user_groups":[{"usrgrpid": usrgrpid}]
+            })
+        else:
+            logging.info(f"Group {lg} already exists, skipping")
 
-        provision_media.append({
-            "name": lg,
-            "mediatypeid": email_media_id,
-            "attribute": build_email(lg)
-        })
+        email = build_email(lg)
+        # idempotent media
+        if (email_media_id, email) not in existing_media:
+            provision_media.append({
+                "name": lg,
+                "mediatypeid": email_media_id,
+                "attribute": email
+            })
+        else:
+            logging.info(f"Email {email} already exists, skipping")
 
     payload = {
         "provision_groups": provision_groups,
