@@ -6,20 +6,27 @@
 import json
 import sys
 import requests
+from requests.packages.urllib3.exceptions import InsecureRequestWarning
 
-# ===== КОНФИГУРАЦИЯ  =====
-ZABBIX_URL = "http://zabbix6.example.com/zabbix/api_jsonrpc.php"
-ZABBIX_USER = "Admin"
-ZABBIX_PASSWORD = "your_password"
+# Подавляем предупреждения о небезопасном HTTPS (для самоподписанных сертификатов)
+requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
+
+# ===== КОНФИГУРАЦИЯ (измените под себя) =====
+ZABBIX_URL = "https://zabbix.cscentr.com/api_jsonrpc.php"
+ZABBIX_USER = "Admin"          # ваш логин
+ZABBIX_PASSWORD = "your_password"  # ваш пароль
 OUTPUT_FILE = "hostgroups_export.json"
-VERIFY_SSL = False   # для HTTP можно False
+VERIFY_SSL = False             # для самоподписанных сертификатов оставляем False
 # ============================================
 
 def zabbix_login(url, user, password):
     payload = {
         "jsonrpc": "2.0",
         "method": "user.login",
-        "params": {"username": user, "password": password},
+        "params": {
+            "user": user,          # в Zabbix 6 используется "user", а не "username"
+            "password": password
+        },
         "id": 1,
         "auth": None
     }
@@ -53,7 +60,6 @@ def main():
     groups = get_all_hostgroups(ZABBIX_URL, token)
     print(f"Found {len(groups)} host groups")
 
-    # Сохраняем в файл
     with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
         json.dump(groups, f, ensure_ascii=False, indent=2)
 
