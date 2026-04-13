@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Импорт групп хостов из JSON-файла в Zabbix 7.
-Поддерживает аутентификацию по API-токену (рекомендуется) или логину/паролю.
+Аутентификация через API-токен (Bearer). Поле 'auth' в теле запроса не используется.
 """
 
 import json
@@ -13,95 +13,54 @@ from requests.packages.urllib3.exceptions import InsecureRequestWarning
 requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 
 # ========================= КОНФИГУРАЦИЯ =========================
-# Zabbix 7 (цель)
 ZABBIX_URL = "http://localhost/api_jsonrpc.php"
-
-# Способ аутентификации: 
-# 1) Использовать API-токен (рекомендуется) - задайте TOKEN, тогда LOGIN/PASSWORD игнорируются
-# 2) Использовать логин/пароль - оставьте TOKEN = None и заполните LOGIN/PASSWORD
-API_TOKEN = "ваш_токен_здесь"   # если не пусто, используем токен
-ZABBIX_USER = "Admin"           # используется только если API_TOKEN не задан
-ZABBIX_PASSWORD = "password"    # используется только если API_TOKEN не задан
+API_TOKEN = "ваш_токен_здесь"          # Токен, созданный в Zabbix 7
 
 INPUT_FILE = "hostgroups_export.json"
-DRY_RUN = False
+DRY_RUN = False                        # True — только просмотр
 VERIFY_SSL = False
 
-# Правила преобразования имён
+# Правила переименования
 RENAME_RULES = [
     {"type": "replace", "old": "/Service/", "new": "/Systems/"},
 ]
 # ================================================================
 
 
-def zabbix_login_with_password(url, user, password):
-    """Аутентификация по логину/паролю (метод user.login)."""
+def zabbix_request(url, token, method, params, request_id=1):
+    """Универсальная функция для вызова API Zabbix с Bearer-токеном."""
+    headers = {"Authorization": f"Bearer {token}"}
     payload = {
         "jsonrpc": "2.0",
-        "method": "user.login",
-        "params": {"user": user, "password": password},
-        "id": 1,
-        # "auth": None   # НЕ передаём auth вообще
+        "method": method,
+        "params": params,
+        "id": request_id,
+        # Поле "auth" отсутствует — при токене оно не нужно
     }
-    resp = requests.post(url, json=payload, verify=VERIFY_SSL, timeout=30)
+    resp = requests.post(url, json=payload, headers=headers, verify=VERIFY_SSL, timeout=30)
     resp.raise_for_status()
     data = resp.json()
     if "error" in data:
-        raise Exception(f"Login error: {data['error']['data']}")
+        raise Exception(f"API error in {method}: {data['error']['data']}")
     return data["result"]
 
 
-def get_existing_group_names(url, token=None, auth_header=None):
-    """Получение существующих групп. token - для метода с auth в теле, auth_header - Bearer токен."""
-    headers = {}
-    payload = {
-        "jsonrpc": "2.0",
-        "method": "hostgroup.get",
-        "params": {"output": ["name"]},
-        "id": 2,
-    }
-    if auth_header:
-        headers["Authorization"] = f"Bearer {auth_header}"
-        payload["auth"] = None   # при Bearer токене поле auth не обязательно, но оставим null
-    elif token:
-        payload["auth"] = token
-    else:
-        raise Exception("No authentication provided")
-
-    resp = requests.post(url, json=payload, headers=headers, verify=VERIFY_SSL, timeout=30)
-    resp.raise_for_status()
-    data = resp.json()
-    if "error" in data:
-        raise Exception(f"API error: {data['error']['data']}")
-    return {g["name"] for g in data["result"]}
+def get_existing_group_names(url, token):
+    """Возвращает множество имён существующих групп хостов."""
+    groups = zabbix_request(url, token, "hostgroup.get", {"output": ["name"]}, 2)
+    return {g["name"] for g in groups}
 
 
-def create_hostgroup(url, name, token=None, auth_header=None):
-    """Создание группы хостов."""
-    headers = {}
-    payload = {
-        "jsonrpc": "2.0",
-        "method": "hostgroup.create",
-        "params": {"name": name},
-        "id": 3,
-    }
-    if auth_header:
-        headers["Authorization"] = f"Bearer {auth_header}"
-        payload["auth"] = None
-    elif token:
-        payload["auth"] = token
-    else:
-        raise Exception("No authentication provided")
-
-    resp = requests.post(url, json=payload, headers=headers, verify=VERIFY_SSL, timeout=30)
-    resp.raise_for_status()
-    data = resp.json()
-    if "error" in data:
-        print(f"Creation failed for '{name}': {data['error']['data']}")
+def create_hostgroup(url, token, name):
+    """Создаёт группу хостов, возвращает True при успехе."""
+    try:
+        result = zabbix_request(url, token, "hostgroup.create", {"name": name}, 3)
+        group_id = result["groupids"][0]
+        print(f"  [OK] Created '{name}' (ID: {group_id})")
+        return True
+    except Exception as e:
+        print(f"  [FAIL] Creation failed for '{name}': {e}")
         return False
-    group_id = data["result"]["groupids"][0]
-    print(f"reated '{name}' (ID: {group_id})")
-    return True
 
 
 def apply_rename_rules(original_name, rules):
@@ -115,7 +74,7 @@ def apply_rename_rules(original_name, rules):
 
 
 def main():
-    # Загрузка групп
+    # Загрузка групп из файла
     try:
         with open(INPUT_FILE, "r", encoding="utf-8") as f:
             groups = json.load(f)
@@ -125,7 +84,7 @@ def main():
 
     print(f"Loaded {len(groups)} groups from {INPUT_FILE}")
 
-    # Преобразование имён
+    # Преобразование имён (уникальные новые имена)
     transformed = {}
     for g in groups:
         old = g["name"]
@@ -138,7 +97,7 @@ def main():
             print("  ... and more")
             break
         if new != old:
-            print(f"  {old} → {new}")
+            print(f"  {old} -> {new}")
         else:
             print(f"  {old} (no change)")
 
@@ -147,44 +106,34 @@ def main():
         print(f"Would create {len(transformed)} groups")
         return
 
-    # Аутентификация
-    auth_header = None
-    token = None
-    if API_TOKEN:
-        print(f"Using API token (Bearer) for Zabbix 7: {ZABBIX_URL}")
-        auth_header = API_TOKEN
-    else:
-        print(f"Logging in to Zabbix 7 with user/password: {ZABBIX_URL}")
-        token = zabbix_login_with_password(ZABBIX_URL, ZABBIX_USER, ZABBIX_PASSWORD)
-        print("Login successful")
+    # Подключение к Zabbix 7 через токен
+    print(f"\nConnecting to Zabbix 7 using API token: {ZABBIX_URL}")
+    existing = get_existing_group_names(ZABBIX_URL, API_TOKEN)
+    print(f"Existing groups in Zabbix 7: {len(existing)}")
 
-    # Получение существующих групп
-    print("Fetching existing host groups...")
-    existing = get_existing_group_names(ZABBIX_URL, token=token, auth_header=auth_header)
-    print(f"Existing groups: {len(existing)}")
-
-    # Создание
+    # Создание недостающих групп
     created = 0
     skipped = 0
     failed = 0
+
     for new_name in transformed.keys():
         if new_name in existing:
-            print(f"Skipping '{new_name}' (already exists)")
+            print(f"  [SKIP] Skipping '{new_name}' (already exists)")
             skipped += 1
             continue
-        if create_hostgroup(ZABBIX_URL, new_name, token=token, auth_header=auth_header):
+        if create_hostgroup(ZABBIX_URL, API_TOKEN, new_name):
             created += 1
             existing.add(new_name)
         else:
             failed += 1
 
-    print("\n" + "="*50)
+    print("\n" + "=" * 50)
     print("IMPORT SUMMARY")
-    print(f"Total unique names: {len(transformed)}")
-    print(f"Created: {created}")
-    print(f"Skipped: {skipped}")
-    print(f"Failed: {failed}")
-    print("="*50)
+    print(f"  Total unique transformed names: {len(transformed)}")
+    print(f"  [OK] Created: {created}")
+    print(f"  [SKIP] Skipped (already exist): {skipped}")
+    print(f"  [FAIL] Failed: {failed}")
+    print("=" * 50)
 
 
 if __name__ == "__main__":
