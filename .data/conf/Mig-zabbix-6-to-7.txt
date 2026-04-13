@@ -1,0 +1,170 @@
+#!/usr/bin/env python3
+
+import json
+import sys
+from typing import Dict, Any, List, Set
+
+import requests
+
+# ==================== КОНФИГУРАЦИЯ ====================
+# Zabbix 6 (источник)
+ZABBIX6_URL = "http://zabbix6.example.com/zabbix/api_jsonrpc.php"
+ZABBIX6_USER = "Admin"
+ZABBIX6_PASSWORD = "your_zabbix6_password"
+
+# Zabbix 7 (цель)
+ZABBIX7_URL = "http://zabbix7.example.com/zabbix/api_jsonrpc.php"
+ZABBIX7_USER = "Admin"
+ZABBIX7_PASSWORD = "your_zabbix7_password"
+
+# Опции
+VERIFY_SSL = False          # Для HTTP можно оставить False
+DRY_RUN = False             # Если True — только показать, что будет создано
+# ======================================================
+
+
+def zabbix_login(url: str, username: str, password: str) -> str:
+    """Аутентификация в Zabbix API, возвращает токен."""
+    payload = {
+        "jsonrpc": "2.0",
+        "method": "user.login",
+        "params": {"username": username, "password": password},
+        "id": 1,
+        "auth": None,
+    }
+    try:
+        resp = requests.post(url, json=payload, verify=VERIFY_SSL, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+        if "error" in data:
+            raise Exception(f"Login error: {data['error']['data']}")
+        return data["result"]
+    except Exception as e:
+        print(f"Login failed to {url}: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+def get_host_groups(url: str, auth_token: str) -> List[Dict[str, Any]]:
+    """Получить все группы хостов из Zabbix."""
+    payload = {
+        "jsonrpc": "2.0",
+        "method": "hostgroup.get",
+        "params": {"output": "extend"},
+        "id": 2,
+        "auth": auth_token,
+    }
+    try:
+        resp = requests.post(url, json=payload, verify=VERIFY_SSL, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+        if "error" in data:
+            raise Exception(f"API error: {data['error']['data']}")
+        return data["result"]
+    except Exception as e:
+        print(f"Failed to get host groups from {url}: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+def get_existing_group_names(url: str, auth_token: str) -> Set[str]:
+    """Получить имена уже существующих групп в целевой системе."""
+    groups = get_host_groups(url, auth_token)
+    return {g["name"] for g in groups}
+
+
+def transform_name(original: str) -> str:
+    return original.replace("/Service/", "/Systems/")
+
+
+def create_host_group(url: str, auth_token: str, name: str) -> bool:
+    """Создать группу хостов в Zabbix. Вернуть True при успехе."""
+    payload = {
+        "jsonrpc": "2.0",
+        "method": "hostgroup.create",
+        "params": {"name": name},
+        "id": 3,
+        "auth": auth_token,
+    }
+    try:
+        resp = requests.post(url, json=payload, verify=VERIFY_SSL, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+        if "error" in data:
+            print(f"Creation failed: {data['error']['data']}")
+            return False
+        group_id = data["result"]["groupids"][0]
+        print(f"Created '{name}' (ID: {group_id})")
+        return True
+    except Exception as e:
+        print(f"Error: {e}")
+        return False
+
+
+def main():
+    print("=== Zabbix 6 → 7 Host Group Migration ===\n")
+
+    # --- 1. Подключение к Zabbix 6 и получение групп ---
+    print(f"Connecting to Zabbix 6: {ZABBIX6_URL}")
+    token6 = zabbix_login(ZABBIX6_URL, ZABBIX6_USER, ZABBIX6_PASSWORD)
+    print("Connected to Zabbix 6")
+
+    print("Fetching host groups from Zabbix 6...")
+    groups6 = get_host_groups(ZABBIX6_URL, token6)
+    print(f"Found {len(groups6)} groups total")
+
+    # Преобразование имён
+    transformed = []
+    for g in groups6:
+        old_name = g["name"]
+        new_name = transform_name(old_name)
+        if new_name != old_name:
+            print(f"Transform: '{old_name}' → '{new_name}'")
+        else:
+            print(f"No change: '{old_name}'")
+        transformed.append((old_name, new_name))
+
+    if DRY_RUN:
+        print("\n--- DRY RUN MODE: NO CHANGES WILL BE MADE ---")
+        print("Groups that would be created in Zabbix 7:")
+        for old, new in transformed:
+            print(f"  {new} (from {old})")
+        return
+
+    # --- 2. Подключение к Zabbix 7 и подготовка ---
+    print(f"\nConnecting to Zabbix 7: {ZABBIX7_URL}")
+    token7 = zabbix_login(ZABBIX7_URL, ZABBIX7_USER, ZABBIX7_PASSWORD)
+    print("Connected to Zabbix 7")
+
+    print("Fetching existing groups from Zabbix 7...")
+    existing_names = get_existing_group_names(ZABBIX7_URL, token7)
+    print(f"Already have {len(existing_names)} groups")
+
+    # --- 3. Создание недостающих групп ---
+    print("\nCreating missing groups in Zabbix 7...")
+    created = 0
+    skipped = 0
+    failed = 0
+
+    for old_name, new_name in transformed:
+        if new_name in existing_names:
+            print(f"Skipping '{new_name}' (already exists)")
+            skipped += 1
+            continue
+
+        if create_host_group(ZABBIX7_URL, token7, new_name):
+            created += 1
+            existing_names.add(new_name)  # обновляем кэш
+        else:
+            failed += 1
+
+    # --- Итог ---
+    print("\n" + "=" * 50)
+    print("IMPORT SUMMARY")
+    print(f"Total groups processed: {len(transformed)}")
+    print(f"Successfully created: {created}")
+    print(f"Skipped (already exist): {skipped}")
+    print(f"Failed: {failed}")
+    print("=" * 50)
+
+
+if __name__ == "__main__":
+    main()
