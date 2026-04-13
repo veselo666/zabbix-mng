@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 Импорт групп хостов из JSON-файла в Zabbix 7.
+Поддерживает аутентификацию по API-токену (рекомендуется) или логину/паролю.
 """
 
 import json
@@ -9,47 +10,38 @@ import sys
 import requests
 from requests.packages.urllib3.exceptions import InsecureRequestWarning
 
-# Подавляем предупреждения о небезопасном HTTPS
 requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 
 # ========================= КОНФИГУРАЦИЯ =========================
 # Zabbix 7 (цель)
-ZABBIX_URL = "https://zabbix.company.com/api_jsonrpc.php"
-ZABBIX_USER = "Admin"
-ZABBIX_PASSWORD = "your_password_here"
+ZABBIX_URL = "http://localhost/api_jsonrpc.php"
 
-# Файл, полученный от скрипта экспорта
+# Способ аутентификации: 
+# 1) Использовать API-токен (рекомендуется) - задайте TOKEN, тогда LOGIN/PASSWORD игнорируются
+# 2) Использовать логин/пароль - оставьте TOKEN = None и заполните LOGIN/PASSWORD
+API_TOKEN = "ваш_токен_здесь"   # если не пусто, используем токен
+ZABBIX_USER = "Admin"           # используется только если API_TOKEN не задан
+ZABBIX_PASSWORD = "password"    # используется только если API_TOKEN не задан
+
 INPUT_FILE = "hostgroups_export.json"
-
-# Режим проверки (True — только показать, что будет сделано, не создавать)
 DRY_RUN = False
-
-# Проверка SSL сертификата (для самоподписанных оставить False)
 VERIFY_SSL = False
 
-# ----------------- Правила преобразования имён -----------------
-# Правила применяются последовательно в порядке списка.
-# Каждое правило — это словарь с ключами:
-#   - "type": "replace"   -> простая замена подстроки (использует str.replace)
-#     "old": "что менять", "new": "на что менять"
-#   - "type": "regex"     -> замена по регулярному выражению (использует re.sub)
-#     "pattern": "регулярка", "repl": "замена" (можно использовать \1, \2 и т.д.)
-#
+# Правила преобразования имён
 RENAME_RULES = [
     {"type": "replace", "old": "/Service/", "new": "/Systems/"},
 ]
-
 # ================================================================
 
 
-def zabbix_login(url, user, password):
-    """Аутентификация в Zabbix API (Zabbix 7 использует параметры 'user' и 'password')."""
+def zabbix_login_with_password(url, user, password):
+    """Аутентификация по логину/паролю (метод user.login)."""
     payload = {
         "jsonrpc": "2.0",
         "method": "user.login",
         "params": {"user": user, "password": password},
         "id": 1,
-        "auth": None,
+        # "auth": None   # НЕ передаём auth вообще
     }
     resp = requests.post(url, json=payload, verify=VERIFY_SSL, timeout=30)
     resp.raise_for_status()
@@ -59,16 +51,24 @@ def zabbix_login(url, user, password):
     return data["result"]
 
 
-def get_existing_group_names(url, token):
-    """Возвращает множество имён групп, уже существующих в Zabbix 7."""
+def get_existing_group_names(url, token=None, auth_header=None):
+    """Получение существующих групп. token - для метода с auth в теле, auth_header - Bearer токен."""
+    headers = {}
     payload = {
         "jsonrpc": "2.0",
         "method": "hostgroup.get",
         "params": {"output": ["name"]},
         "id": 2,
-        "auth": token,
     }
-    resp = requests.post(url, json=payload, verify=VERIFY_SSL, timeout=30)
+    if auth_header:
+        headers["Authorization"] = f"Bearer {auth_header}"
+        payload["auth"] = None   # при Bearer токене поле auth не обязательно, но оставим null
+    elif token:
+        payload["auth"] = token
+    else:
+        raise Exception("No authentication provided")
+
+    resp = requests.post(url, json=payload, headers=headers, verify=VERIFY_SSL, timeout=30)
     resp.raise_for_status()
     data = resp.json()
     if "error" in data:
@@ -76,119 +76,115 @@ def get_existing_group_names(url, token):
     return {g["name"] for g in data["result"]}
 
 
-def create_hostgroup(url, token, name):
-    """Создаёт группу хостов, возвращает True при успехе."""
+def create_hostgroup(url, name, token=None, auth_header=None):
+    """Создание группы хостов."""
+    headers = {}
     payload = {
         "jsonrpc": "2.0",
         "method": "hostgroup.create",
         "params": {"name": name},
         "id": 3,
-        "auth": token,
     }
-    resp = requests.post(url, json=payload, verify=VERIFY_SSL, timeout=30)
+    if auth_header:
+        headers["Authorization"] = f"Bearer {auth_header}"
+        payload["auth"] = None
+    elif token:
+        payload["auth"] = token
+    else:
+        raise Exception("No authentication provided")
+
+    resp = requests.post(url, json=payload, headers=headers, verify=VERIFY_SSL, timeout=30)
     resp.raise_for_status()
     data = resp.json()
     if "error" in data:
         print(f"Creation failed for '{name}': {data['error']['data']}")
         return False
     group_id = data["result"]["groupids"][0]
-    print(f"Created '{name}' (ID: {group_id})")
+    print(f"reated '{name}' (ID: {group_id})")
     return True
 
 
 def apply_rename_rules(original_name, rules):
-    """
-    Применяет список правил преобразования к имени.
-    Правила применяются последовательно.
-    """
     new_name = original_name
     for rule in rules:
         if rule["type"] == "replace":
             new_name = new_name.replace(rule["old"], rule["new"])
         elif rule["type"] == "regex":
             new_name = re.sub(rule["pattern"], rule["repl"], new_name)
-        else:
-            raise ValueError(f"Unknown rule type: {rule['type']}")
     return new_name
 
 
 def main():
-    # 1. Загрузка групп из файла
+    # Загрузка групп
     try:
         with open(INPUT_FILE, "r", encoding="utf-8") as f:
             groups = json.load(f)
-    except FileNotFoundError:
-        print(f"ERROR: File '{INPUT_FILE}' not found", file=sys.stderr)
-        sys.exit(1)
-    except json.JSONDecodeError as e:
-        print(f"ERROR: Invalid JSON: {e}", file=sys.stderr)
+    except Exception as e:
+        print(f"ERROR reading file: {e}", file=sys.stderr)
         sys.exit(1)
 
     print(f"Loaded {len(groups)} groups from {INPUT_FILE}")
 
-    # 2. Преобразование имён (уникальные имена, так как несколько старых могут дать одно новое)
-    transformed = {}  # new_name -> original_name (для отчёта)
+    # Преобразование имён
+    transformed = {}
     for g in groups:
         old = g["name"]
         new = apply_rename_rules(old, RENAME_RULES)
         transformed[new] = old
 
-    # 3. Показать, что будет изменено
-    print("\nName transformation preview (only first 10 shown):")
-    shown = 0
-    for new, old in transformed.items():
-        if shown >= 10 and len(transformed) > 10:
+    print("\nName transformation preview (first 10):")
+    for i, (new, old) in enumerate(transformed.items()):
+        if i >= 10:
             print("  ... and more")
             break
         if new != old:
             print(f"  {old} → {new}")
         else:
             print(f"  {old} (no change)")
-        shown += 1
 
     if DRY_RUN:
         print("\n--- DRY RUN: no changes will be made ---")
-        print(f"Would create {len(transformed)} groups in Zabbix 7:")
-        for name in list(transformed.keys())[:20]:
-            print(f"  {name}")
-        if len(transformed) > 20:
-            print(f"  ... and {len(transformed)-20} more")
+        print(f"Would create {len(transformed)} groups")
         return
 
-    # 4. Подключение к Zabbix 7
-    print(f"\nConnecting to Zabbix 7: {ZABBIX_URL}")
-    token = zabbix_login(ZABBIX_URL, ZABBIX_USER, ZABBIX_PASSWORD)
-    print("Login successful")
+    # Аутентификация
+    auth_header = None
+    token = None
+    if API_TOKEN:
+        print(f"Using API token (Bearer) for Zabbix 7: {ZABBIX_URL}")
+        auth_header = API_TOKEN
+    else:
+        print(f"Logging in to Zabbix 7 with user/password: {ZABBIX_URL}")
+        token = zabbix_login_with_password(ZABBIX_URL, ZABBIX_USER, ZABBIX_PASSWORD)
+        print("Login successful")
 
-    # 5. Получаем существующие группы
-    existing = get_existing_group_names(ZABBIX_URL, token)
-    print(f"Existing groups in Zabbix 7: {len(existing)}")
+    # Получение существующих групп
+    print("Fetching existing host groups...")
+    existing = get_existing_group_names(ZABBIX_URL, token=token, auth_header=auth_header)
+    print(f"Existing groups: {len(existing)}")
 
-    # 6. Создаём недостающие
+    # Создание
     created = 0
     skipped = 0
     failed = 0
-
     for new_name in transformed.keys():
         if new_name in existing:
             print(f"Skipping '{new_name}' (already exists)")
             skipped += 1
             continue
-
-        if create_hostgroup(ZABBIX_URL, token, new_name):
+        if create_hostgroup(ZABBIX_URL, new_name, token=token, auth_header=auth_header):
             created += 1
-            existing.add(new_name)  # обновляем кэш
+            existing.add(new_name)
         else:
             failed += 1
 
-    # 7. Итог
-    print("\n" + "=" * 50)
+    print("\n" + "="*50)
     print("IMPORT SUMMARY")
-    print(f"Total unique transformed names: {len(transformed)}")
+    print(f"Total unique names: {len(transformed)}")
     print(f"Created: {created}")
-    print(f"Skipped (already exist): {skipped}")
+    print(f"Skipped: {skipped}")
     print(f"Failed: {failed}")
-    print("=" * 50)
+    print("="*50)
 
 
 if __name__ == "__main__":
